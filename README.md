@@ -15,7 +15,8 @@ A lightweight and fast Telegram bot that **downloads files from any direct URL**
 
 ## 🛠️ Live Bot
 
-> ⚡ A live instance is currently running!  
+> ⚡ A live instance is currently running!
+> https://t.me/url_uploader_HM_bot
 > Just send a valid file URL and the bot will handle the rest.
 
 ---
