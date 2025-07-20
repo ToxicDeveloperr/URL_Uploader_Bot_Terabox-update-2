@@ -1,0 +1,23 @@
+# Ignore build artifacts
+/target
+*.bin
+
+# Ignore environment and secrets
+.env
+
+# Ignore Git files
+.git
+.gitignore
+
+# Ignore Docker build files (optional)
+Dockerfile
+.dockerignore
+
+# Ignore OS/system files
+__pycache__/
+*.py[cod]
+*.log
+
+# Ignore IDE/editor folders
+.vscode/
+.idea/
