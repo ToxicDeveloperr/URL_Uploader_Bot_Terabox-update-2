@@ -144,7 +144,7 @@ impl Bot {
             \n\
             🌟 <b>Features:</b>\n\
             \u{2022} Free & fast\n\
-            \u{2022} <a href=\"https://github.com/Herman/url-uploader\">Open source</a>\n\
+            \u{2022} <a href=\"https://github.com/HerMan-Official/URL_Uploader_Bot_Telegram\">Open source</a>\n\
             \u{2022} Uploads files up to 2GB\n\
             \u{2022} Redirect-friendly",
         ))
