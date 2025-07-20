@@ -22,7 +22,7 @@ A lightweight and fast Telegram bot that **downloads files from any direct URL**
 
 ## 👤 Developer
 
-### ✨ Updated & Maintained by **Herman**  
+### ✨ Updated & Maintained by **-Herman**  
 > 🔧 Modernized a dead codebase with improvements and bug fixes.
 
 > 🙏 Special thanks to [altfoxie](https://github.com/altfoxie) for the original base code.
