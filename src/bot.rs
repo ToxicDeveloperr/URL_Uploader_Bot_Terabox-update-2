@@ -12,6 +12,7 @@ use grammers_client::{
 use log::{error, info, warn};
 use reqwest::Url;
 use scopeguard::defer;
+use serde_json::Value;
 use stream_cancel::{Trigger, Valved};
 use tokio::sync::Mutex;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
@@ -39,12 +40,64 @@ impl Bot {
             me,
             http: reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36")
+            .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
             .build()?,
             locks: Arc::new(DashSet::new()),
             started_by: Arc::new(DashMap::new()),
             triggers: Arc::new(DashMap::new()),
         }))
+    }
+
+    /// Check if URL is from Terabox domain
+    fn is_terabox_url(&self, url: &Url) -> bool {
+        if let Some(domain) = url.domain() {
+            let domain = domain.to_lowercase();
+            domain.contains("terabox") || 
+            domain.contains("1024tera") || 
+            domain.contains("4funbox") ||
+            domain.contains("mirrobox") ||
+            domain.contains("nephobox") ||
+            domain.contains("terasharelink") ||
+            domain.contains("terafileshare")
+        } else {
+            false
+        }
+    }
+
+    /// Get final stream link for Terabox URLs
+    async fn get_final_stream_link(&self, terabox_url: &str) -> Result<Option<String>> {
+        let api_url = "https://teradl.in/api/teradl.php";
+        
+        let response = self.http
+            .get(api_url)
+            .query(&[("url", terabox_url)])
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+            .header("Accept", "*/*")
+            .header("Referer", "https://teradl.in/")
+            .header("Accept-Encoding", "gzip, deflate, br, zstd")
+            .header("Accept-Language", "en-US,en;q=0.5")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("Sec-Fetch-Dest", "empty")
+            .header("Sec-GPC", "1")
+            .send()
+            .await?;
+
+        if response.status().is_success() {
+            let data: Value = response.json().await?;
+            
+            if let Some(success) = data.get("success") {
+                if success.as_bool().unwrap_or(false) {
+                    if let Some(proxy_url) = data.get("proxy_url") {
+                        if let Some(url_str) = proxy_url.as_str() {
+                            return Ok(Some(url_str.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Run the bot.
@@ -146,7 +199,8 @@ impl Bot {
             \u{2022} Free & fast\n\
             \u{2022} <a href=\"https://github.com/HerMan-Official/URL_Uploader_Bot_Telegram\">Open source</a>\n\
             \u{2022} Uploads files up to 2GB\n\
-            \u{2022} Redirect-friendly",
+            \u{2022} Redirect-friendly\n\
+            \u{2022} <b>Terabox support</b>",
         ))
         .await?;
         Ok(())
@@ -201,8 +255,39 @@ impl Bot {
             self.started_by.remove(&msg.chat().id());
         };
 
-        info!("Downloading file from {}", url);
-        let response = self.http.get(url).send().await?;
+        // Check if it's a Terabox URL and get the proxy URL if needed
+        let download_url = if self.is_terabox_url(&url) {
+            info!("Detected Terabox URL: {}", url);
+            msg.reply("🔄 Processing Terabox link...").await?;
+            
+            match self.get_final_stream_link(url.as_str()).await {
+                Ok(Some(proxy_url)) => {
+                    info!("Got proxy URL for Terabox: {}", proxy_url);
+                    match Url::parse(&proxy_url) {
+                        Ok(parsed_url) => parsed_url,
+                        Err(err) => {
+                            msg.reply(format!("❌ Failed to parse proxy URL: {}", err)).await?;
+                            return Ok(());
+                        }
+                    }
+                }
+                Ok(None) => {
+                    msg.reply("❌ Failed to get download link from Terabox. The file might be private or the link is invalid.").await?;
+                    return Ok(());
+                }
+                Err(err) => {
+                    error!("Error getting Terabox proxy URL: {}", err);
+                    msg.reply("❌ Failed to process Terabox link. Please try again.").await?;
+                    return Ok(());
+                }
+            }
+        } else {
+            // Use the original URL for non-Terabox links
+            url
+        };
+
+        info!("Downloading file from {}", download_url);
+        let response = self.http.get(download_url).send().await?;
 
         // Get the file name and size
         let length = response.content_length().unwrap_or_default() as usize;
