@@ -16,12 +16,15 @@ use serde_json::Value;
 use stream_cancel::{Trigger, Valved};
 use tokio::sync::Mutex;
 use tokio_util::compat::FuturesAsyncReadCompatExt;
+use mongodb::{Client as MongoClient, Collection, Database};
+use regex::Regex;
+use chrono::Utc;
 
 use crate::command::{parse_command, Command};
+use crate::models::{BatchPost, UploadedFile, PostStatus};
 
 /// Bot is the main struct of the bot.
 /// All the bot logic is implemented in this struct.
-#[derive(Debug)]
 pub struct Bot {
     client: Client,
     me: User,
@@ -29,12 +32,33 @@ pub struct Bot {
     locks: Arc<DashSet<i64>>,
     started_by: Arc<DashMap<i64, i64>>,
     triggers: Arc<DashMap<i64, Trigger>>,
+    // MongoDB collections
+    db: Database,
+    batch_posts: Collection<BatchPost>,
+    // Configuration
+    input_channel_id: i64,
+    store_channel_id: i64,
 }
 
 impl Bot {
     /// Create a new bot instance.
-    pub async fn new(client: Client) -> Result<Arc<Self>> {
+    pub async fn new(client: Client, mongo_uri: &str, input_channel_id: i64, store_channel_id: i64) -> Result<Arc<Self>> {
         let me = client.get_me().await?;
+        
+        // Connect to MongoDB
+        let mongo_client = MongoClient::with_uri_str(mongo_uri).await?;
+        let db = mongo_client.database("terabox_bot");
+        let batch_posts = db.collection::<BatchPost>("batch_posts");
+        
+        // Create TTL index for automatic cleanup
+        use mongodb::options::IndexOptions;
+        use mongodb::IndexModel;
+        let index = IndexModel::builder()
+            .keys(mongodb::bson::doc! { "expires_at": 1 })
+            .options(IndexOptions::builder().expire_after(Duration::from_secs(0)).build())
+            .build();
+        batch_posts.create_index(index, None).await?;
+        
         Ok(Arc::new(Self {
             client,
             me,
@@ -45,6 +69,10 @@ impl Bot {
             locks: Arc::new(DashSet::new()),
             started_by: Arc::new(DashMap::new()),
             triggers: Arc::new(DashMap::new()),
+            db,
+            batch_posts,
+            input_channel_id,
+            store_channel_id,
         }))
     }
 
@@ -138,6 +166,11 @@ impl Bot {
     /// Ensures the message is from a user or a group, and then parses the command.
     /// If the command is not recognized, it will try to parse the message as a URL.
     async fn handle_message(&self, msg: Message) -> Result<()> {
+        // Check if this message is from the input channel
+        if msg.chat().id() == self.input_channel_id {
+            return self.handle_input_channel_message(msg).await;
+        }
+
         // Ensure the message chat is a user or a group
         match msg.chat() {
             Chat::User(_) | Chat::Group(_) => {}
@@ -493,6 +526,285 @@ impl Bot {
 
             query.answer().send().await?;
         }
+        Ok(())
+    }
+
+    /// Handle input channel messages for batch processing
+    async fn handle_input_channel_message(&self, msg: Message) -> Result<()> {
+        let message_text = msg.text();
+        let post_id = msg.id();
+        let channel_id = msg.chat().id();
+        
+        info!("Processing batch message from input channel: post_id={}, channel_id={}", post_id, channel_id);
+        
+        // Extract Terabox links from the message
+        let detected_links = self.extract_terabox_links(message_text);
+        
+        if detected_links.is_empty() {
+            info!("No Terabox links found in message {}", post_id);
+            return Ok(());
+        }
+        
+        info!("Found {} Terabox links in message {}", detected_links.len(), post_id);
+        
+        // Create batch post entry in MongoDB
+        let batch_post = BatchPost::new(post_id, channel_id, message_text.to_string(), detected_links.clone());
+        self.batch_posts.insert_one(&batch_post, None).await?;
+        
+        // Start processing links with timeout
+        let self_clone = Arc::clone(&self);
+        let msg_clone = msg.clone();
+        tokio::spawn(async move {
+            // Set up 6-hour timeout
+            let timeout_duration = Duration::from_secs(6 * 60 * 60); // 6 hours
+            
+            let result = tokio::time::timeout(
+                timeout_duration,
+                self_clone.process_batch_links(post_id, channel_id, detected_links, msg_clone)
+            ).await;
+            
+            match result {
+                Ok(Ok(())) => {
+                    info!("Batch processing completed successfully for post {}", post_id);
+                }
+                Ok(Err(e)) => {
+                    error!("Error during batch processing for post {}: {}", post_id, e);
+                    if let Err(e) = self_clone.mark_batch_failed(post_id, channel_id).await {
+                        error!("Failed to mark batch as failed: {}", e);
+                    }
+                }
+                Err(_) => {
+                    warn!("Batch processing timed out for post {}", post_id);
+                    if let Err(e) = self_clone.mark_batch_timeout(post_id, channel_id).await {
+                        error!("Failed to mark batch as timeout: {}", e);
+                    }
+                }
+            }
+        });
+        
+        Ok(())
+    }
+    
+    /// Extract Terabox links from message text
+    fn extract_terabox_links(&self, text: &str) -> Vec<String> {
+        let url_regex = Regex::new(r"https?://[^\s]+").unwrap();
+        let mut terabox_links = Vec::new();
+        
+        for cap in url_regex.find_iter(text) {
+            let url_str = cap.as_str();
+            if let Ok(url) = Url::parse(url_str) {
+                if self.is_terabox_url(&url) {
+                    terabox_links.push(url_str.to_string());
+                }
+            }
+        }
+        
+        terabox_links
+    }
+    
+    /// Process batch of links sequentially
+    async fn process_batch_links(&self, post_id: i32, channel_id: i64, links: Vec<String>, original_msg: Message) -> Result<()> {
+        for (index, link) in links.iter().enumerate() {
+            info!("Processing link {}/{} for post {}: {}", index + 1, links.len(), post_id, link);
+            
+            match self.process_single_terabox_link(link, post_id, channel_id).await {
+                Ok(uploaded_file) => {
+                    info!("Successfully processed link {}: {}", index + 1, uploaded_file.file_name);
+                }
+                Err(e) => {
+                    error!("Failed to process link {}: {} - Error: {}", index + 1, link, e);
+                    // Continue with next link instead of failing entire batch
+                    continue;
+                }
+            }
+        }
+        
+        // Check if all links are processed and send completion message
+        if let Ok(batch_post) = self.get_batch_post(post_id, channel_id).await {
+            if matches!(batch_post.status, PostStatus::Done) {
+                self.send_completion_message(&original_msg, &batch_post).await?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Process a single Terabox link and upload to store channel
+    async fn process_single_terabox_link(&self, terabox_url: &str, post_id: i32, channel_id: i64) -> Result<UploadedFile> {
+        // Get final stream link
+        let download_url = match self.get_final_stream_link(terabox_url).await? {
+            Some(url) => url,
+            None => return Err(anyhow::anyhow!("Failed to get download link from Terabox")),
+        };
+        
+        // Download file
+        let response = self.http.get(&download_url).send().await?;
+        let length = response.content_length().unwrap_or_default() as usize;
+        
+        // Get file name
+        let name = self.extract_filename_from_response(&response).unwrap_or_else(|| "unknown_file.bin".to_string());
+        
+        // Check file constraints
+        if length == 0 {
+            return Err(anyhow::anyhow!("File is empty"));
+        }
+        if length > 2 * 1024 * 1024 * 1024 {
+            return Err(anyhow::anyhow!("File is too large"));
+        }
+        
+        // Upload to Telegram
+        let stream = response.bytes_stream().map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err));
+        let mut async_read = stream.into_async_read().compat();
+        
+        let file = self.client.upload_stream(&mut async_read, length, name.clone()).await?;
+        
+        // Send to store channel
+        let store_channel = grammers_client::types::Chat::from_id(self.store_channel_id);
+        let mut input_msg = InputMessage::text(format!("File: {}", name)).document(file);
+        
+        // Set video attribute if it's a video file
+        if name.to_lowercase().ends_with(".mp4") {
+            input_msg = input_msg.attribute(grammers_client::types::Attribute::Video {
+                supports_streaming: false,
+                duration: Duration::ZERO,
+                w: 0,
+                h: 0,
+                round_message: false,
+            });
+        }
+        
+        let sent_msg = self.client.send_message(&store_channel, input_msg).await?;
+        let file_id = self.extract_file_id_from_message(&sent_msg)?;
+        
+        // Create uploaded file record
+        let uploaded_file = UploadedFile {
+            original_url: terabox_url.to_string(),
+            file_name: name,
+            telegram_file_id: file_id,
+            store_channel_msg_id: sent_msg.id(),
+        };
+        
+        // Update MongoDB with uploaded file
+        self.update_batch_post_with_upload(post_id, channel_id, uploaded_file.clone()).await?;
+        
+        Ok(uploaded_file)
+    }
+    
+    /// Extract filename from HTTP response
+    fn extract_filename_from_response(&self, response: &reqwest::Response) -> Option<String> {
+        response
+            .headers()
+            .get("content-disposition")
+            .and_then(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .split(';')
+                            .map(|value| value.trim())
+                            .find(|value| value.starts_with("filename="))
+                    })
+                    .map(|value| value.trim_start_matches("filename="))
+                    .map(|value| value.trim_matches('"'))
+            })
+            .map(|name| name.to_string())
+            .or_else(|| {
+                response
+                    .url()
+                    .path_segments()
+                    .and_then(|segments| segments.last())
+                    .map(|name| name.to_string())
+            })
+    }
+    
+    /// Extract file ID from sent message
+    fn extract_file_id_from_message(&self, msg: &Message) -> Result<String> {
+        if let Some(media) = msg.media() {
+            match media {
+                grammers_client::types::Media::Document(doc) => {
+                    Ok(format!("{:?}", doc.id()))
+                }
+                grammers_client::types::Media::Video(video) => {
+                    Ok(format!("{:?}", video.id()))
+                }
+                _ => Err(anyhow::anyhow!("Unsupported media type")),
+            }
+        } else {
+            Err(anyhow::anyhow!("No media found in message"))
+        }
+    }
+    
+    /// Update batch post with uploaded file
+    async fn update_batch_post_with_upload(&self, post_id: i32, channel_id: i64, uploaded_file: UploadedFile) -> Result<()> {
+        use mongodb::bson::doc;
+        
+        let filter = doc! { "post_id": post_id, "channel_id": channel_id };
+        let update = doc! {
+            "$push": { "uploaded": mongodb::bson::to_bson(&uploaded_file)? }
+        };
+        
+        self.batch_posts.update_one(filter.clone(), update, None).await?;
+        
+        // Check if all links are uploaded and update status
+        if let Ok(batch_post) = self.get_batch_post(post_id, channel_id).await {
+            if batch_post.uploaded.len() == batch_post.detected_links.len() {
+                let status_update = doc! {
+                    "$set": { "status": "done" }
+                };
+                self.batch_posts.update_one(filter, status_update, None).await?;
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Get batch post from MongoDB
+    async fn get_batch_post(&self, post_id: i32, channel_id: i64) -> Result<BatchPost> {
+        use mongodb::bson::doc;
+        
+        let filter = doc! { "post_id": post_id, "channel_id": channel_id };
+        match self.batch_posts.find_one(filter, None).await? {
+            Some(batch_post) => Ok(batch_post),
+            None => Err(anyhow::anyhow!("Batch post not found")),
+        }
+    }
+    
+    /// Mark batch as failed
+    async fn mark_batch_failed(&self, post_id: i32, channel_id: i64) -> Result<()> {
+        use mongodb::bson::doc;
+        
+        let filter = doc! { "post_id": post_id, "channel_id": channel_id };
+        let update = doc! { "$set": { "status": "failed" } };
+        
+        self.batch_posts.update_one(filter, update, None).await?;
+        Ok(())
+    }
+    
+    /// Mark batch as timeout
+    async fn mark_batch_timeout(&self, post_id: i32, channel_id: i64) -> Result<()> {
+        use mongodb::bson::doc;
+        
+        let filter = doc! { "post_id": post_id, "channel_id": channel_id };
+        let update = doc! { "$set": { "status": "timeout" } };
+        
+        self.batch_posts.update_one(filter, update, None).await?;
+        Ok(())
+    }
+    
+    /// Send completion message to input channel
+    async fn send_completion_message(&self, original_msg: &Message, batch_post: &BatchPost) -> Result<()> {
+        let mut message_lines = vec!["/store_file_id".to_string()];
+        
+        for uploaded_file in &batch_post.uploaded {
+            message_lines.push(uploaded_file.telegram_file_id.clone());
+        }
+        
+        let completion_message = message_lines.join("\n");
+        
+        original_msg.reply(InputMessage::text(completion_message)).await?;
+        
+        info!("Sent completion message for batch post {}", batch_post.post_id);
         Ok(())
     }
 }
