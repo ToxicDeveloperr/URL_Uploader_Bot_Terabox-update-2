@@ -13,6 +13,7 @@ use simplelog::TermLogger;
 
 mod bot;
 mod command;
+mod models;
 
 async fn health_check() -> &'static str {
     "OK"
@@ -40,6 +41,13 @@ async fn main() -> Result<()> {
         .parse()?;
     let api_hash = std::env::var("API_HASH").context("API_HASH env is not set")?;
     let bot_token = std::env::var("BOT_TOKEN").context("BOT_TOKEN env is not set")?;
+    let mongo_uri = std::env::var("MONGO_URI").context("MONGO_URI env is not set")?;
+    let input_channel_id = std::env::var("INPUT_CHANNEL_ID")
+        .context("INPUT_CHANNEL_ID env is not set")?
+        .parse::<i64>()?;
+    let store_channel_id = std::env::var("STORE_CHANNEL_ID")
+        .context("STORE_CHANNEL_ID env is not set")?
+        .parse::<i64>()?;
 
     // Fill in the configuration and connect to Telegram
     static RECONNECTION_POLICY: &dyn ReconnectionPolicy = &FixedReconnect {
@@ -67,7 +75,7 @@ async fn main() -> Result<()> {
     client.session().save_to_file("session.bin")?;
 
     // Create the bot
-    let bot = Bot::new(client).await?;
+    let bot = Bot::new(client, &mongo_uri, input_channel_id, store_channel_id).await?;
     
     // Create the HTTP server
     let app = Router::new().route("/", get(health_check));
