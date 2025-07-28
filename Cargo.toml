@@ -10,12 +10,15 @@ reqwest = { version = "0.12.8", default-features = false, features = [
     "brotli",
     "gzip",
     "deflate",
-    "json",  # <-- Ye bhi add kar do JSON support ke liye
+    "json"
 ] }
 axum = "0.7.4"
 tower = "0.4.13"
 anyhow = "1.0.89"
-chrono = "0.4.38"
+
+# 👇 Sabse important: serde feature on for chrono!
+chrono = { version = "0.4.38", features = ["serde"] }
+
 grammers-client = { version = "0.7.0", features = ["html"] }
 grammers-session = "0.7.0"
 grammers-mtsender = "0.7.0"
@@ -33,8 +36,10 @@ stream-cancel = "0.8.2"
 mime_guess = "2.0.5"
 percent-encoding = "2.3.1"
 mp4 = "0.14.0"
-serde_json = "1.0"  # <- Ye add karo
+serde_json = "1.0"
 mongodb = "2.8.0"
 serde = { version = "1.0", features = ["derive"] }
 regex = "1.10.2"
+
+# 👇 uuid with serde feature (sahi hai)
 uuid = { version = "1.8.0", features = ["v4", "serde"] }
